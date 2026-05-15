@@ -42,12 +42,3 @@ large_files_by_user_*.csv
 # OS files
 .DS_Store
 Thumbs.db
-
-# Keep release/build metadata under version control
-!StorageAnalyzer.spec
-!version_info.txt
-!requirements-build.txt
-!build_exe.bat
-!build_exe_clean.bat
-!RUN_COMPILED_EXE_AS_ADMIN.bat
-!app.ico
