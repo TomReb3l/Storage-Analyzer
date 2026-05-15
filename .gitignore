@@ -1,0 +1,53 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller / build outputs
+build/
+dist/
+*.spec
+*.manifest
+
+# Installer / executable artifacts
+*.exe
+*.msi
+*.zip
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+
+# Local exports from the app
+storage_analyzer_report_*.xlsx
+storage_analyzer_report_*.pdf
+storage_analyzer_summary_*.csv
+storage_analyzer_large_files_*.csv
+user_folder_summary_*.csv
+large_files_by_user_*.csv
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Keep release/build metadata under version control
+!StorageAnalyzer.spec
+!version_info.txt
+!requirements-build.txt
+!build_exe.bat
+!build_exe_clean.bat
+!RUN_COMPILED_EXE_AS_ADMIN.bat
+!app.ico
