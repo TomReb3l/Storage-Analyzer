@@ -52,33 +52,6 @@ RUN_STORAGE_ANALYZER.bat
 python -m pip install -r requirements.txt
 python storage_analyzer.py
 ```
-
-## Build σε EXE
-
-```bat
-build_exe.bat
-```
-
-Το τελικό αρχείο δημιουργείται στο:
-
-```text
-dist\StorageAnalyzer.exe
-```
-
-Για καθαρό build:
-
-```bat
-build_exe_clean.bat
-```
-
-## Περιεχόμενα release
-
-- `storage_analyzer.py` - κύριο πρόγραμμα
-- `requirements.txt` - source dependencies
-- `requirements-build.txt` - build dependencies
-- `StorageAnalyzer.spec` - PyInstaller spec με icon/UAC/metadata
-- `version_info.txt` - Windows EXE metadata
-- `app.ico` - εικονίδιο εφαρμογής
 - `build_exe.bat` - build script
 - `build_exe_clean.bat` - clean build script
 - `RUN_STORAGE_ANALYZER.bat` - source runner
