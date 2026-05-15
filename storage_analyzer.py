@@ -12,10 +12,6 @@ Windows user profiles μέσω Win32_UserProfile, ώστε να αφαιρούν
 Χρήση:
   python storage_analyzer.py
 
-Προαιρετικό EXE:
-  pyinstaller StorageAnalyzer.spec
-"""
-
 from __future__ import annotations
 
 import ctypes
