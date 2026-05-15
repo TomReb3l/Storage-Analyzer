@@ -5,6 +5,10 @@ Storage Analyzer
 Σαρώνει τους φακέλους χρηστών σε Windows, υπολογίζει το συνολικό μέγεθος
 κάθε προφίλ και βρίσκει τα μεγαλύτερα αρχεία ανά χρήστη. Τα αποτελέσματα εξάγονται χειροκίνητα σε Excel όταν το επιλέξει ο διαχειριστής.
 
+Περιλαμβάνει προαιρετική, χειροκίνητη και επιβεβαιωμένη διαγραφή επιλεγμένων
+Windows user profiles μέσω Win32_UserProfile, ώστε να αφαιρούνται καθαρά
+και οι αντίστοιχες εγγραφές profile/registry των Windows.
+
 Χρήση:
   python storage_analyzer.py
 
@@ -16,9 +20,11 @@ from __future__ import annotations
 
 import ctypes
 import heapq
+import json
 import os
 import queue
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -27,11 +33,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_TITLE = "Storage Analyzer"
 DEFAULT_SCAN_ROOT = r"C:\Users"
 REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+PROTECTED_PROFILE_NAMES = {
+    "public",
+    "default",
+    "default user",
+    "all users",
+    "defaultuser0",
+    "wdagutilityaccount",
+}
 
 # Dark UI palette.  No external UI dependency is used, so the EXE remains simple.
 COLOR_BG = "#0B1120"
@@ -80,6 +94,18 @@ class UserScanResult:
     skipped_reparse_count: int = 0
     large_files: list[LargeFile] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+
+
+@dataclass
+class ProfileDeleteResult:
+    user_name: str
+    folder_path: str
+    status: str
+    message: str
+    sid: str = ""
+    loaded: Optional[bool] = None
+    special: Optional[bool] = None
+    timestamp: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 class ScanCancelled(Exception):
@@ -388,6 +414,127 @@ def sanitize_filename_part(value: str) -> str:
     return cleaned.strip(" .") or "export"
 
 
+def normalize_win_path(value: str) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(os.path.abspath(value)))
+    except Exception:
+        return os.path.normcase(os.path.normpath(str(value)))
+
+
+def is_current_user_profile_path(folder_path: str) -> bool:
+    current_profile = os.environ.get("USERPROFILE", "")
+    if not current_profile:
+        return False
+    return normalize_win_path(folder_path) == normalize_win_path(current_profile)
+
+
+def is_protected_profile_folder(folder_path: str) -> bool:
+    name = Path(folder_path).name.strip().lower()
+    return name in PROTECTED_PROFILE_NAMES or is_current_user_profile_path(folder_path)
+
+
+def delete_windows_user_profile(user_name: str, folder_path: str) -> ProfileDeleteResult:
+    """Delete a Windows user profile through Win32_UserProfile.
+
+    This intentionally avoids plain folder deletion because that can leave
+    ProfileList registry entries and broken Windows profile metadata behind.
+    """
+    if not is_windows():
+        return ProfileDeleteResult(user_name, folder_path, "error", "Η διαγραφή προφίλ υποστηρίζεται μόνο σε Windows.")
+    if not is_admin():
+        return ProfileDeleteResult(user_name, folder_path, "error", "Απαιτούνται δικαιώματα Administrator.")
+    if is_protected_profile_folder(folder_path):
+        return ProfileDeleteResult(
+            user_name,
+            folder_path,
+            "blocked",
+            "Προστατευμένο ή τρέχον προφίλ. Δεν επιτρέπεται διαγραφή από το εργαλείο.",
+        )
+
+    ps_script = r'''
+$TargetPath = $args[0]
+$ErrorActionPreference = 'Stop'
+$result = [ordered]@{
+    status = ''
+    message = ''
+    path = $TargetPath
+    sid = ''
+    loaded = $null
+    special = $null
+}
+try {
+    $normalizedTarget = [System.IO.Path]::GetFullPath($TargetPath).TrimEnd('\')
+    $profile = Get-CimInstance -ClassName Win32_UserProfile | Where-Object {
+        $_.LocalPath -and ([System.IO.Path]::GetFullPath($_.LocalPath).TrimEnd('\') -ieq $normalizedTarget)
+    } | Select-Object -First 1
+
+    if ($null -eq $profile) {
+        $result.status = 'not_found'
+        $result.message = 'Δεν βρέθηκε Win32_UserProfile entry για αυτόν τον φάκελο. Δεν έγινε απλή διαγραφή φακέλου για λόγους ασφάλειας.'
+    }
+    else {
+        $result.sid = [string]$profile.SID
+        $result.loaded = [bool]$profile.Loaded
+        $result.special = [bool]$profile.Special
+
+        if ([bool]$profile.Special) {
+            $result.status = 'blocked'
+            $result.message = 'Το προφίλ είναι Special/System profile και δεν διαγράφηκε.'
+        }
+        elseif ([bool]$profile.Loaded) {
+            $result.status = 'blocked'
+            $result.message = 'Το προφίλ είναι φορτωμένο/ενεργό. Κάνε log off τον χρήστη και ξαναδοκίμασε.'
+        }
+        else {
+            Remove-CimInstance -InputObject $profile -ErrorAction Stop
+            $result.status = 'deleted'
+            $result.message = 'Το προφίλ διαγράφηκε μέσω Win32_UserProfile.'
+        }
+    }
+}
+catch {
+    $result.status = 'error'
+    $result.message = $_.Exception.Message
+}
+$result | ConvertTo-Json -Compress
+'''
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps_script,
+                str(folder_path),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=600,
+            check=False,
+        )
+        raw = (completed.stdout or "").strip()
+        if not raw:
+            message = (completed.stderr or "Άγνωστο σφάλμα PowerShell.").strip()
+            return ProfileDeleteResult(user_name, folder_path, "error", message)
+        data = json.loads(raw.splitlines()[-1])
+        return ProfileDeleteResult(
+            user_name=user_name,
+            folder_path=folder_path,
+            status=str(data.get("status", "error")),
+            message=str(data.get("message", "")),
+            sid=str(data.get("sid", "") or ""),
+            loaded=data.get("loaded"),
+            special=data.get("special"),
+        )
+    except subprocess.TimeoutExpired:
+        return ProfileDeleteResult(user_name, folder_path, "error", "Η διαγραφή ξεπέρασε το χρονικό όριο.")
+    except Exception as exc:
+        return ProfileDeleteResult(user_name, folder_path, "error", str(exc))
+
+
 def iter_user_folders(root: str) -> Iterable[Path]:
     root_path = Path(root)
     if not root_path.exists():
@@ -493,7 +640,7 @@ def iter_large_file_rows(results: list[UserScanResult]):
             yield r, lf, modified
 
 
-def export_excel_results(results: list[UserScanResult], out: Path, timestamp: str) -> Path:
+def export_excel_results(results: list[UserScanResult], out: Path, timestamp: str, deletion_log: Optional[list[ProfileDeleteResult]] = None) -> Path:
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
@@ -509,6 +656,7 @@ def export_excel_results(results: list[UserScanResult], out: Path, timestamp: st
     ws_meta.title = "Report Info"
     ws_summary = wb.create_sheet("User Summary")
     ws_large = wb.create_sheet("Large Files")
+    ws_delete = wb.create_sheet("Deletion Log") if deletion_log else None
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
@@ -533,7 +681,8 @@ def export_excel_results(results: list[UserScanResult], out: Path, timestamp: st
         ("Total files", sum(r.file_count for r in results)),
         ("Total folders", sum(r.folder_count for r in results)),
         ("Total scan errors", sum(r.error_count for r in results)),
-        ("Note", "Read-only report. No files were deleted, moved or modified."),
+        ("Deletion log entries", len(deletion_log or [])),
+        ("Note", "Το Excel δημιουργείται χειροκίνητα από τον διαχειριστή. Η διαγραφή προφίλ, αν έγινε, καταγράφεται στο Deletion Log."),
     ]
     ws_meta.append(["Field", "Value"])
     style_header(ws_meta, 1, 2)
@@ -585,13 +734,35 @@ def export_excel_results(results: list[UserScanResult], out: Path, timestamp: st
     ws_large.freeze_panes = "A2"
     ws_large.auto_filter.ref = ws_large.dimensions
 
+    if ws_delete is not None:
+        delete_headers = ["Timestamp", "User", "Folder", "Status", "Message", "SID", "Loaded", "Special"]
+        ws_delete.append(delete_headers)
+        style_header(ws_delete, 1, len(delete_headers))
+        for entry in deletion_log or []:
+            ws_delete.append([
+                entry.timestamp,
+                entry.user_name,
+                entry.folder_path,
+                entry.status,
+                entry.message,
+                entry.sid,
+                "" if entry.loaded is None else str(entry.loaded),
+                "" if entry.special is None else str(entry.special),
+            ])
+        ws_delete.freeze_panes = "A2"
+        ws_delete.auto_filter.ref = ws_delete.dimensions
+
     # Formatting and widths
     sheet_widths = {
         "Report Info": {"A": 24, "B": 90},
         "User Summary": {"A": 24, "B": 65, "C": 18, "D": 14, "E": 14, "F": 14, "G": 12, "H": 24, "I": 16},
         "Large Files": {"A": 24, "B": 18, "C": 14, "D": 20, "E": 110},
+        "Deletion Log": {"A": 20, "B": 24, "C": 70, "D": 14, "E": 90, "F": 46, "G": 12, "H": 12},
     }
-    for ws in (ws_summary, ws_large):
+    export_sheets = [ws_summary, ws_large]
+    if ws_delete is not None:
+        export_sheets.append(ws_delete)
+    for ws in export_sheets:
         for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
             for cell in row:
                 cell.border = border
@@ -607,7 +778,7 @@ def export_excel_results(results: list[UserScanResult], out: Path, timestamp: st
             ws.row_dimensions[row_idx].height = 18
 
     # Numeric formats
-    for ws in (ws_summary, ws_large):
+    for ws in export_sheets:
         for row in ws.iter_rows(min_row=2):
             for cell in row:
                 if isinstance(cell.value, int):
@@ -619,12 +790,12 @@ def export_excel_results(results: list[UserScanResult], out: Path, timestamp: st
     return xlsx_path
 
 
-def export_results(results: list[UserScanResult], output_dir: str) -> dict[str, str]:
+def export_results(results: list[UserScanResult], output_dir: str, deletion_log: Optional[list[ProfileDeleteResult]] = None) -> dict[str, str]:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    xlsx_path = export_excel_results(results, out, timestamp)
+    xlsx_path = export_excel_results(results, out, timestamp, deletion_log=deletion_log)
 
     return {
         "excel": str(xlsx_path),
@@ -643,8 +814,11 @@ class StorageAnalyzerApp(tk.Tk):
         self.result_queue: queue.Queue = queue.Queue()
         self.cancel_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
+        self.delete_worker: Optional[threading.Thread] = None
         self.results: list[UserScanResult] = []
         self.current_partial: dict[str, UserScanResult] = {}
+        self.delete_selection: set[str] = set()
+        self.deletion_log: list[ProfileDeleteResult] = []
         self.last_exported: dict[str, str] = {}
 
         self.scan_root_var = tk.StringVar(value=DEFAULT_SCAN_ROOT)
@@ -788,7 +962,7 @@ class StorageAnalyzerApp(tk.Tk):
         ).pack(anchor="w")
         tk.Label(
             title_box,
-            text="Σάρωση προφίλ χρηστών, μέγεθος φακέλων και μεγάλα αρχεία — read-only εργαλείο.",
+            text="Σάρωση προφίλ χρηστών, μεγάλα αρχεία και ασφαλής διαγραφή επιλεγμένων Windows profiles.",
             bg=COLOR_BG,
             fg=COLOR_MUTED,
             font=FONT_SMALL,
@@ -911,6 +1085,20 @@ class StorageAnalyzerApp(tk.Tk):
         self.export_btn.pack(side="left", padx=(8, 0))
         self.export_btn.configure(state="disabled")
 
+        self.delete_btn = RoundedButton(
+            buttons,
+            text="Διαγραφή επιλεγμένων",
+            command=self._delete_selected_profiles,
+            width=190,
+            height=38,
+            bg_color=COLOR_DANGER,
+            hover_color=COLOR_DANGER_HOVER,
+            active_color="#B91C1C",
+            background=COLOR_BG,
+        )
+        self.delete_btn.pack(side="left", padx=(8, 0))
+        self.delete_btn.configure(state="disabled")
+
 
         main_pane = ttk.PanedWindow(root, orient="vertical", style="TPanedwindow")
         main_pane.pack(fill="both", expand=True)
@@ -918,10 +1106,11 @@ class StorageAnalyzerApp(tk.Tk):
         summary_frame = ttk.LabelFrame(main_pane, text="Μέγεθος φακέλου ανά χρήστη", padding=10, style="Card.TLabelframe")
         self.summary_tree = ttk.Treeview(
             summary_frame,
-            columns=("size", "bytes", "files", "folders", "errors", "skipped", "path"),
+            columns=("delete", "size", "bytes", "files", "folders", "errors", "skipped", "path"),
             show="headings",
             height=10,
         )
+        self.summary_tree.heading("delete", text="Διαγραφή")
         self.summary_tree.heading("size", text="Μέγεθος")
         self.summary_tree.heading("bytes", text="Bytes")
         self.summary_tree.heading("files", text="Αρχεία")
@@ -929,6 +1118,7 @@ class StorageAnalyzerApp(tk.Tk):
         self.summary_tree.heading("errors", text="Σφάλματα")
         self.summary_tree.heading("skipped", text="Junctions/Symlinks")
         self.summary_tree.heading("path", text="Φάκελος")
+        self.summary_tree.column("delete", width=90, anchor="center")
         self.summary_tree.column("size", width=110, anchor="e")
         self.summary_tree.column("bytes", width=130, anchor="e")
         self.summary_tree.column("files", width=90, anchor="e")
@@ -943,6 +1133,7 @@ class StorageAnalyzerApp(tk.Tk):
         summary_scroll.pack(side="right", fill="y")
         self.summary_tree.configure(yscrollcommand=summary_scroll.set)
         self.summary_tree.bind("<<TreeviewSelect>>", self._on_user_selected)
+        self.summary_tree.bind("<Button-1>", self._on_summary_click, add="+")
         main_pane.add(summary_frame, weight=1)
 
         files_frame = ttk.LabelFrame(main_pane, text="Μεγαλύτερα αρχεία επιλεγμένου χρήστη", padding=10, style="Card.TLabelframe")
@@ -1026,11 +1217,13 @@ class StorageAnalyzerApp(tk.Tk):
         self.cancel_event.clear()
         self.results = []
         self.current_partial = {}
+        self.delete_selection.clear()
         self.last_exported = {}
         self._clear_trees()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.export_btn.configure(state="disabled")
+        self.delete_btn.configure(state="disabled")
         self.status_var.set("Ξεκίνησε η σάρωση...")
 
         self.worker = threading.Thread(
@@ -1087,6 +1280,14 @@ class StorageAnalyzerApp(tk.Tk):
                     self._finish_scan(cancelled=False)
                 elif msg_type == "cancelled":
                     self._finish_scan(cancelled=True)
+                elif msg_type == "delete_info":
+                    self.status_var.set(str(payload))
+                elif msg_type == "delete_result":
+                    self._handle_delete_result(payload)
+                elif msg_type == "delete_done":
+                    self._finish_delete()
+                elif msg_type == "delete_error":
+                    self._finish_delete(error=str(payload))
                 elif msg_type == "error":
                     self._finish_scan(cancelled=True)
                     messagebox.showerror("Σφάλμα σάρωσης", str(payload))
@@ -1121,12 +1322,14 @@ class StorageAnalyzerApp(tk.Tk):
 
         for index, r in enumerate(sorted(self.results, key=lambda x: x.total_bytes, reverse=True)):
             tag = "even" if index % 2 == 0 else "odd"
+            checked = "☑" if r.folder_path in self.delete_selection else "☐"
             self.summary_tree.insert(
                 "",
                 "end",
                 iid=r.user_name,
                 tags=(tag,),
                 values=(
+                    checked,
                     format_bytes(r.total_bytes),
                     f"{r.total_bytes:,}",
                     f"{r.file_count:,}",
@@ -1139,6 +1342,141 @@ class StorageAnalyzerApp(tk.Tk):
 
         if selected_user and self.summary_tree.exists(selected_user):
             self.summary_tree.selection_set(selected_user)
+
+    def _on_summary_click(self, event) -> None:
+        region = self.summary_tree.identify("region", event.x, event.y)
+        column = self.summary_tree.identify_column(event.x)
+        item = self.summary_tree.identify_row(event.y)
+        if region == "cell" and column == "#1" and item:
+            result = next((r for r in self.results if r.user_name == item), None)
+            if not result:
+                return
+            if result.folder_path in self.delete_selection:
+                self.delete_selection.remove(result.folder_path)
+            else:
+                self.delete_selection.add(result.folder_path)
+            self._refresh_summary_tree()
+            if self.summary_tree.exists(item):
+                self.summary_tree.selection_set(item)
+            self._update_delete_button_state()
+            return "break"
+        return None
+
+    def _update_delete_button_state(self) -> None:
+        scanning = bool(self.worker and self.worker.is_alive())
+        deleting = bool(self.delete_worker and self.delete_worker.is_alive())
+        enabled = bool(self.delete_selection) and not scanning and not deleting
+        self.delete_btn.configure(state="normal" if enabled else "disabled")
+
+    def _selected_delete_results(self) -> list[UserScanResult]:
+        selected_paths = set(self.delete_selection)
+        return [r for r in self.results if r.folder_path in selected_paths]
+
+    def _delete_selected_profiles(self) -> None:
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Διαγραφή", "Δεν μπορεί να γίνει διαγραφή όσο εκτελείται σάρωση.")
+            return
+        if self.delete_worker and self.delete_worker.is_alive():
+            messagebox.showinfo("Διαγραφή", "Η διαγραφή ήδη εκτελείται.")
+            return
+
+        selected = self._selected_delete_results()
+        if not selected:
+            messagebox.showinfo("Διαγραφή", "Δεν έχεις επιλέξει προφίλ για διαγραφή.")
+            return
+
+        protected = [r for r in selected if is_protected_profile_folder(r.folder_path)]
+        allowed = [r for r in selected if not is_protected_profile_folder(r.folder_path)]
+        if protected:
+            protected_text = "\n".join(f"- {r.user_name}: {r.folder_path}" for r in protected[:10])
+            messagebox.showwarning(
+                "Προστατευμένα προφίλ",
+                "Τα παρακάτω προφίλ δεν θα διαγραφούν γιατί είναι προστατευμένα ή είναι το τρέχον προφίλ:\n\n"
+                f"{protected_text}"
+                + ("\n..." if len(protected) > 10 else ""),
+            )
+        if not allowed:
+            self.delete_selection.clear()
+            self._refresh_summary_tree()
+            self._update_delete_button_state()
+            return
+
+        preview = "\n".join(f"- {r.user_name}: {r.folder_path}" for r in allowed[:12])
+        if len(allowed) > 12:
+            preview += f"\n...και άλλα {len(allowed) - 12}"
+
+        if not messagebox.askyesno(
+            "Επιβεβαίωση διαγραφής προφίλ",
+            "ΠΡΟΣΟΧΗ: Η ενέργεια είναι μόνιμη. Θα διαγραφούν τα επιλεγμένα Windows user profiles "
+            "μέσω Win32_UserProfile, μαζί με τα αντίστοιχα Windows profile metadata/registry entries.\n\n"
+            f"Προφίλ προς διαγραφή: {len(allowed)}\n\n{preview}\n\nΣυνέχεια;",
+            icon="warning",
+        ):
+            return
+
+        typed = simpledialog.askstring(
+            "Τελική επιβεβαίωση",
+            "Για να συνεχίσει η διαγραφή, πληκτρολόγησε ακριβώς:\n\nDELETE",
+            parent=self,
+        )
+        if typed != "DELETE":
+            messagebox.showinfo("Ακύρωση", "Η διαγραφή ακυρώθηκε. Δεν έγινε καμία αλλαγή.")
+            return
+
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="disabled")
+        self.export_btn.configure(state="disabled")
+        self.delete_btn.configure(state="disabled")
+        self.status_var.set(f"Ξεκίνησε διαγραφή {len(allowed)} προφίλ...")
+
+        self.delete_worker = threading.Thread(target=self._delete_profiles_worker, args=(allowed,), daemon=True)
+        self.delete_worker.start()
+
+    def _delete_profiles_worker(self, selected: list[UserScanResult]) -> None:
+        try:
+            for index, result in enumerate(selected, start=1):
+                self.result_queue.put(("delete_info", f"Διαγραφή {index}/{len(selected)}: {result.user_name}"))
+                delete_result = delete_windows_user_profile(result.user_name, result.folder_path)
+                self.result_queue.put(("delete_result", delete_result))
+            self.result_queue.put(("delete_done", None))
+        except Exception as exc:
+            self.result_queue.put(("delete_error", str(exc)))
+
+    def _handle_delete_result(self, result: ProfileDeleteResult) -> None:
+        self.deletion_log.append(result)
+        if result.status == "deleted":
+            self.results = [r for r in self.results if r.folder_path != result.folder_path]
+            self.delete_selection.discard(result.folder_path)
+            self.status_var.set(f"Διαγράφηκε: {result.user_name}")
+        else:
+            self.delete_selection.discard(result.folder_path)
+            self.status_var.set(f"Δεν διαγράφηκε: {result.user_name} | {result.status}: {result.message}")
+        self._refresh_summary_tree()
+        self._update_delete_button_state()
+
+    def _finish_delete(self, error: str = "") -> None:
+        self.start_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
+        self.export_btn.configure(state="normal" if (self.results or self.deletion_log) else "disabled")
+        self._update_delete_button_state()
+        deleted = sum(1 for r in self.deletion_log if r.status == "deleted")
+        blocked = sum(1 for r in self.deletion_log if r.status == "blocked")
+        failed = sum(1 for r in self.deletion_log if r.status in {"error", "not_found"})
+        if error:
+            self.status_var.set("Η διαγραφή σταμάτησε με σφάλμα.")
+            messagebox.showerror("Σφάλμα διαγραφής", error)
+            return
+        self.status_var.set(
+            f"Η διαγραφή ολοκληρώθηκε. Διαγράφηκαν: {deleted} | Μπλοκαρίστηκαν: {blocked} | Απέτυχαν/δεν βρέθηκαν: {failed}"
+        )
+        messagebox.showinfo(
+            "Η διαγραφή ολοκληρώθηκε",
+            "Η διαδικασία διαγραφής ολοκληρώθηκε.\n\n"
+            f"Διαγράφηκαν: {deleted}\n"
+            f"Μπλοκαρίστηκαν: {blocked}\n"
+            f"Απέτυχαν/δεν βρέθηκαν: {failed}\n\n"
+            "Πάτησε Export Excel αν θέλεις αναφορά με το Deletion Log.",
+        )
 
     def _on_user_selected(self, _event=None) -> None:
         selection = self.summary_tree.selection()
@@ -1170,6 +1508,7 @@ class StorageAnalyzerApp(tk.Tk):
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
         self.export_btn.configure(state="normal" if self.results else "disabled")
+        self._update_delete_button_state()
         if cancelled:
             self.status_var.set(f"Η σάρωση ακυρώθηκε. Ολοκληρωμένοι χρήστες: {len(self.results)}")
         else:
@@ -1188,12 +1527,12 @@ class StorageAnalyzerApp(tk.Tk):
             )
 
     def _export(self, show_popup: bool = True) -> None:
-        if not self.results:
+        if not self.results and not self.deletion_log:
             if show_popup:
                 messagebox.showinfo("Export", "Δεν υπάρχουν αποτελέσματα για export.")
             return
         try:
-            exported = export_results(self.results, self.output_dir_var.get().strip())
+            exported = export_results(self.results, self.output_dir_var.get().strip(), deletion_log=self.deletion_log)
             self.last_exported = exported
             self.status_var.set(
                 f"Export Excel ολοκληρώθηκε | Excel: {exported['excel']}"
