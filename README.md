@@ -52,7 +52,3 @@ RUN_STORAGE_ANALYZER.bat
 python -m pip install -r requirements.txt
 python storage_analyzer.py
 ```
-- `build_exe.bat` - build script
-- `build_exe_clean.bat` - clean build script
-- `RUN_STORAGE_ANALYZER.bat` - source runner
-- `RUN_COMPILED_EXE_AS_ADMIN.bat` - runner για compiled EXE
